@@ -1,0 +1,8 @@
+# Core scientific stack
+numpy>=1.23
+opencv-python>=4.8
+Pillow>=10.0
+
+# Enhancement (Gabor) — fallback CLAHE si non dispo
+scikit-image>=0.21
+fingerprint-enhancer>=0.0.14

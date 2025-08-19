@@ -1,0 +1,14 @@
+# pyproject.toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fingerprint-dl"
+version = "0.1.0"
+description = "DL minutiae extractor (FingerFlow wrapper)"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]  
+

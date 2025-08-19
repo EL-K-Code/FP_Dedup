@@ -1,0 +1,9 @@
+# ignore tout dossier de venv à n'importe quel niveau
+**/.venv/
+**/venv/
+**/env/
+**//
+models/
+**/models/
+*.h5
+*.weights

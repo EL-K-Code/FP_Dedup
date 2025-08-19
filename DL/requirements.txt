@@ -1,0 +1,12 @@
+# DL only (CPU)
+numpy<2
+matplotlib<3.9
+tensorflow-cpu==2.15.0.post1
+scipy==1.11.4
+fingerflow>=3.0.0
+opencv-python-headless>=4.8
+pandas>=2.0
+gdown>=5.2.0
+requests>=2.31
+tqdm>=4.66
+
