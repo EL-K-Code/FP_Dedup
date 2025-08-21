@@ -1,32 +1,43 @@
-import cv2
+# run_extract_dl.py
 import glob
 from pathlib import Path
 from fp.dl_extractor import DLMinutiaeExtractor
 
-
+# Initialize extractor
 extr = DLMinutiaeExtractor(
     coarse="models/CoarseNet.h5",
     fine="models/FineNet.h5",
     classify="models/ClassifyNet_6_classes.h5",
     core="models/CoreNet.weights",
 )
-data_dir = Path("data")
-out_dir = Path("out")
-out_dir.mkdir(exist_ok=True, parents=True)
-image_paths = []
-for ext in ["*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff"]:
-    image_paths.extend(glob.glob(str(data_dir / ext)))
 
-print(f"🔍 {len(image_paths)} images trouvées dans {data_dir}")
-for img_path in image_paths:
-    print(f"\n📂 Traitement : {img_path}")
-    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        print(f"⚠️ Impossible de lire {img_path}, on saute.")
-        continue
-    stem = Path(img_path).stem
-    res = extr.extract(img, out_dir=out_dir, stem=stem, save_overlay=True)
+DATA_DIR = Path("data")
+OUT_DIR = Path("out")
+OUT_DIR.mkdir(exist_ok=True, parents=True)
 
-    print(f"✅ {len(res.minutiae)} minuties extraites pour {stem}")
-    for m in res.minutiae:
-        print(m.x, m.y, m.angle_deg, m.score, m.classe)
+EXTS = ("*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff", "*.bmp", "*.BMP")
+
+# Collect images (non-recursive; change to rglob for recursion)
+paths = []
+for pat in EXTS:
+    paths.extend(glob.glob(str(DATA_DIR / pat)))
+paths = sorted(set(paths))
+
+print(f"Found {len(paths)} images in {DATA_DIR}")
+
+for p in paths:
+    print(f"\n▶ Processing: {p}")
+    stem = Path(p).stem
+
+    # Pass the PATH directly — extractor loads & normalizes internally
+    res = extr.extract(
+        img_or_path=p,
+        out_dir=OUT_DIR,  # results go to out/<stem>/
+        stem=stem,
+        save_overlay=True,
+        min_short=320,
+    )
+
+    print(f"✅ Extracted {len(res.minutiae)} minutiae for {stem}")
+    for m in res.minutiae[:10]:
+        print(m.x, m.y, f"{m.angle_deg:.2f}", f"{m.score:.3f}", m.classe)
