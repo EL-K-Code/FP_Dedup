@@ -25,4 +25,4 @@ RUN python -m pip install --upgrade pip && \
 COPY . /app
 
 ENV PYTHONPATH=/app/src
-CMD ["python", "scripts/run_extract_dl.py"]
+CMD ["python", "scripts/run_verifier.py"]
