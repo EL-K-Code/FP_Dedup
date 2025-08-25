@@ -1,186 +1,217 @@
-# minutiae_verifier.py
+# src/fp/minutiae_verifier.py
+# Reusable minutiae matching engine:
+# - loads minutiae (x, y, theta_img_deg) from out/<stem>/<stem>.json|.csv
+# - estimates global alignment (rotation + translation, optional scale)
+# - greedy 1-to-1 matching with distance + orientation checks
+# - returns a similarity score in [0,1] from the number of matches
+
 from __future__ import annotations
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Union
-import json, csv, math, re
+from dataclasses import dataclass
+from typing import List, Tuple, Dict
+import csv, json, math
 import numpy as np
 
-# --------------------------- I/O ---------------------------
+# --------------------- Small angle utils ---------------------
+def _wrap_pi(a: float) -> float:
+    """Wrap angle to (-pi, pi]."""
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
 
-def load_minutiae_from_out(out_dir: Union[str, Path], stem: str) -> Optional[List[Dict]]:
+def _ang_diff(a: float, b: float) -> float:
+    """Smallest absolute difference between two angles (radians)."""
+    return abs(_wrap_pi(a - b))
+
+def _deg2rad(d: float) -> float:
+    return float(d) * math.pi / 180.0
+
+def _rad2deg(r: float) -> float:
+    return float(r) * 180.0 / math.pi
+
+
+# --------------------- Data structure ------------------------
+@dataclass
+class Minutia:
+    x: float
+    y: float
+    theta_rad: float  # radians in image coordinates
+
+# ------------------------ I/O loader -------------------------
+def load_minutiae(out_dir: Path, stem: str) -> List[Minutia]:
     """
-    Load minutiae list for a given image 'stem' from:
-      out/<stem>/<stem>.json  (preferred)
-      out/<stem>/<stem>.csv   (fallback)
-    Each minutia should contain at least: x, y, theta_img_deg (or theta), score, class.
+    Load minutiae from out/<stem>/<stem>.json or .csv.
+    Expected angle key: 'theta_img_deg' (deg). Fallback to 'theta'.
     """
-    out_dir = Path(out_dir)
     base = out_dir / stem / stem
     j = base.with_suffix(".json")
     c = base.with_suffix(".csv")
+    mins: List[Minutia] = []
+
     if j.exists():
-        with open(j, "r", encoding="utf-8") as f:
-            return json.load(f)
+        data = json.loads(j.read_text(encoding="utf-8"))
+        for m in data:
+            th_deg = float(m.get("theta_img_deg", m.get("theta", 0.0)))
+            mins.append(Minutia(float(m["x"]), float(m["y"]), _deg2rad(th_deg)))
+        return mins
+
     if c.exists():
-        mins = []
         with open(c, "r", newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
-                mins.append({
-                    "x": int(float(row.get("x", 0))),
-                    "y": int(float(row.get("y", 0))),
-                    "theta_img_deg": float(row.get("theta_img_deg", row.get("theta", 0.0))),
-                    "score": float(row.get("score", 0.0)),
-                    "class": row.get("class", row.get("type", "")),
-                })
+                th_deg = float(row.get("theta_img_deg", row.get("theta", 0.0)))
+                mins.append(Minutia(float(row["x"]), float(row["y"]), _deg2rad(th_deg)))
         return mins
-    return None
 
-# --------------------------- geometry ---------------------------
+    raise FileNotFoundError(f"No minutiae file for '{stem}' (looked for {j} / {c}).")
 
-def _deg2rad(a: float) -> float: return a * math.pi / 180.0
-def _wrap_pi(a: float) -> float: return (a + math.pi) % (2.0 * math.pi) - math.pi
-def _R(theta: float) -> np.ndarray:
-    c, s = math.cos(theta), math.sin(theta)
-    return np.array([[c, -s], [s, c]], dtype=np.float64)
-def _rot(R: np.ndarray, X: np.ndarray) -> np.ndarray:
-    return (R @ X.T).T
 
-# --------------------------- alignment (vote on rotation) ---------------------------
-
-def estimate_similarity(
-    A: np.ndarray, thA: np.ndarray,
-    B: np.ndarray, thB: np.ndarray,
-    use_scale: bool = False, scale_tol: float = 0.10,
-    top_k: int = 200
-) -> Tuple[float, np.ndarray, float]:
+# ------------------ Step B: global alignment -----------------
+def vote_rotation(minsA: List[Minutia],
+                  minsB: List[Minutia],
+                  bin_deg: float = 2.0,
+                  top_k: int = 3,
+                  rng_seed: int = 123) -> List[float]:
     """
-    Return (theta, t, s). If use_scale=False, s=1.
-    Strategy:
-      - sample up to 'top_k' pairs (i,j) to vote a global rotation
-      - pick a few top rotation bins, compute t (and optional s) from centroids
+    Hough-like voting over orientation differences to propose global rotation(s) in radians.
+    Returns up to top_k rotation candidates, highest votes first.
     """
-    nA, nB = len(A), len(B)
-    if nA == 0 or nB == 0:
-        return 0.0, np.zeros(2), 1.0
+    if not minsA or not minsB:
+        return [0.0]
 
-    # choose seeds
-    k = max(1, int(math.sqrt(top_k)))
-    ia = np.random.choice(nA, size=min(nA, 2*k), replace=False)
-    ib = np.random.choice(nB, size=min(nB, 2*k), replace=False)
+    bin_rad = math.radians(bin_deg)
+    nbins   = max(4, int(round((2.0 * math.pi) / bin_rad)))
+    hist    = np.zeros(nbins, dtype=np.int32)
 
-    # rotation accumulator (2° bins)
-    bins = np.linspace(-math.pi, math.pi, 181)
-    acc = np.zeros(len(bins), dtype=np.int32)
-    for i in ia:
-        for j in ib:
-            dtheta = _wrap_pi(_deg2rad(thB[j]) - _deg2rad(thA[i]))
-            b = int(np.digitize([dtheta], bins)[0]) - 1
-            b = max(0, min(b, len(bins)-1))
-            acc[b] += 1
+    rng = np.random.default_rng(rng_seed)
+    # Light random sampling for speed (2*sqrt(n) from each side, at least 10)
+    IA = rng.choice(len(minsA), size=min(len(minsA), max(10, int(2 * math.sqrt(len(minsA))))), replace=False)
+    IB = rng.choice(len(minsB), size=min(len(minsB), max(10, int(2 * math.sqrt(len(minsB))))), replace=False)
 
-    if acc.max() == 0:
-        return 0.0, np.zeros(2), 1.0
+    for i in IA:
+        ai = minsA[i]
+        for j in IB:
+            bj = minsB[j]
+            dth = _wrap_pi(bj.theta_rad - ai.theta_rad)  # (-pi,pi]
+            b   = int(((dth + math.pi) / (2.0 * math.pi)) * nbins) % nbins
+            hist[b] += 1
 
-    # try a few best rotations
-    top_bins = np.argsort(acc)[::-1][:3]
+    cand_bins = np.argsort(hist)[::-1][:max(1, top_k)]
+    cands = []
+    for b in cand_bins:
+        center = (-math.pi) + (b + 0.5) * (2.0 * math.pi / nbins)
+        cands.append(center)
+    return cands
+
+
+def estimate_alignment(minsA: List[Minutia],
+                       minsB: List[Minutia],
+                       use_scale: bool = False) -> Tuple[float, np.ndarray, float]:
+    """
+    Estimate (theta, t, s) such that A' = s * R(theta) * A + t approximately aligns A to B.
+    - theta: radians
+    - t: (tx, ty)
+    - s: ~1.0 (only if use_scale=True)
+    """
+    if not minsA or not minsB:
+        return 0.0, np.zeros(2, dtype=float), 1.0
+
+    thetas = vote_rotation(minsA, minsB)
+    Axy = np.array([[m.x, m.y] for m in minsA], dtype=float)
+    Bxy = np.array([[m.x, m.y] for m in minsB], dtype=float)
+
     best = None
-    for b in top_bins:
-        theta = float((bins[b] + (bins[1] - bins[0]) / 2.0))
-        R = _R(theta)
+    for th in thetas:
+        c, s = math.cos(th), math.sin(th)
+        R = np.array([[c, -s], [s, c]], dtype=float)
+        A_rot = (R @ Axy.T).T
+
         if use_scale:
-            cA, cB = A.mean(0), B.mean(0)
-            dA = np.linalg.norm(A - cA, axis=1) + 1e-6
-            dB = np.linalg.norm(B - cB, axis=1) + 1e-6
-            s = float(np.median(dB) / np.median(dA))
-            s = float(np.clip(s, 1.0 - scale_tol, 1.0 + scale_tol))
+            cenA = A_rot.mean(axis=0)
+            cenB = Bxy.mean(axis=0)
+            rA = np.median(np.linalg.norm(A_rot - cenA, axis=1))
+            rB = np.median(np.linalg.norm(Bxy - cenB, axis=1))
+            sc = 1.0 if rA <= 1e-6 else np.clip(rB / rA, 0.85, 1.15)
         else:
-            s = 1.0
-        t = B.mean(0) - s * _rot(R, A).mean(0)
-        vote = acc[b]
-        if best is None or vote > best[3]:
-            best = (theta, t, s, vote)
+            sc = 1.0
 
-    theta, t, s, _ = best
-    return float(theta), t.astype(np.float64), float(s)
+        t = Bxy.mean(axis=0) - sc * A_rot.mean(axis=0)
+        # simple selection: keep the candidate with higher vote (order of thetas)
+        cand = (th, t, sc)
+        best = cand if best is None else best
 
-# --------------------------- matching after alignment ---------------------------
+    return best[0], best[1], best[2]
 
-def greedy_match(
-    A: np.ndarray, thA: np.ndarray,
-    B: np.ndarray, thB: np.ndarray,
-    theta: float, t: np.ndarray, s: float,
-    dist_tol: float = 15.0, ang_tol_deg: float = 20.0
-) -> List[Tuple[int, int]]:
+
+# ----------- Step C: greedy 1-to-1 minutiae matching --------
+def greedy_match(minsA: List[Minutia], minsB: List[Minutia],
+                 theta: float, t: np.ndarray, s: float,
+                 dist_tol_px: float = 15.0,
+                 ang_tol_deg: float = 20.0) -> Tuple[int, List[Tuple[int,int]]]:
     """
-    Greedy 1-to-1 pairing after applying the similarity transform.
-    Match if distance <= dist_tol and angular residual <= ang_tol_deg.
+    Apply A' = s*R(theta)*A + t. Greedy nearest-neighbor 1-to-1 matching with:
+      - Euclidean distance <= dist_tol_px,
+      - orientation residual <= ang_tol_deg (accounting for global rotation).
+    Returns (match_count, list_of_pairs).
     """
-    R = _R(theta)
-    A2 = s * _rot(R, A) + t
-    usedB = np.zeros(len(B), dtype=bool)
-    pairs = []
-    for i in range(len(A2)):
-        d = np.linalg.norm(B - A2[i], axis=1)
-        j = int(np.argmin(d))
-        if usedB[j]:
+    if not minsA or not minsB:
+        return 0, []
+
+    c, si = math.cos(theta), math.sin(theta)
+    R = np.array([[c, -si], [si, c]], dtype=float)
+
+    Axy = np.array([[m.x, m.y] for m in minsA], dtype=float)
+    Axy = (s * (R @ Axy.T).T) + t
+    Bxy = np.array([[m.x, m.y] for m in minsB], dtype=float)
+
+    used_B = np.zeros(len(minsB), dtype=bool)
+    pairs: List[Tuple[int,int]] = []
+    ang_tol = math.radians(ang_tol_deg)
+
+    for i, a in enumerate(Axy):
+        dists = np.linalg.norm(Bxy - a, axis=1)
+        j = int(np.argmin(dists))
+        if used_B[j]:
             continue
-        if d[j] <= dist_tol:
-            dth = abs(_wrap_pi(_deg2rad(thB[j]) - _deg2rad(thA[i]) - theta))
-            if dth <= _deg2rad(ang_tol_deg):
-                usedB[j] = True
-                pairs.append((i, j))
-    return pairs
+        if dists[j] > dist_tol_px:
+            continue
 
-# --------------------------- public API ---------------------------
+        # expected: theta_B ≈ theta_A + theta (mod 2π)
+        res = _ang_diff(minsB[j].theta_rad, minsA[i].theta_rad + theta)
+        if res > ang_tol:
+            continue
 
+        used_B[j] = True
+        pairs.append((i, j))
+
+    return len(pairs), pairs
+
+
+# -------------------- High-level API class -------------------
 class MinutiaeVerifier:
     """
-    Minutiae-based verifier using rigid alignment (R, t) and greedy matching.
-    Returns a similarity score in [0,1] from raw match count with a soft cap.
+    Reusable engine:
+      verifier = MinutiaeVerifier(dist_tol_px=15, ang_tol_deg=20, use_scale=False)
+      res = verifier.score_pair(out_dir, "stemA", "stemB")
     """
-    def __init__(
-        self,
-        out_dir: Union[str, Path] = "out",
-        dist_tol_px: float = 15.0,
-        ang_tol_deg: float = 20.0,
-        use_scale: bool = False,
-        scale_tol: float = 0.10
-    ):
-        self.out_dir = Path(out_dir)
+    def __init__(self,
+                 dist_tol_px: float = 15.0,
+                 ang_tol_deg: float = 20.0,
+                 use_scale: bool = False):
         self.dist_tol_px = float(dist_tol_px)
         self.ang_tol_deg = float(ang_tol_deg)
-        self.use_scale = bool(use_scale)
-        self.scale_tol = float(scale_tol)
+        self.use_scale   = bool(use_scale)
 
-    def _load(self, stem: str) -> List[Dict]:
-        mins = load_minutiae_from_out(self.out_dir, stem) or []
-        return mins
-
-    def score_pair(self, stemA: str, stemB: str) -> Dict[str, float]:
-        """
-        Score two templates identified by their stems (folder names under out/).
-        Returns:
-            {
-              "score": float in [0,1],
-              "matches": int,
-              "theta": float (rad),
-              "tx": float, "ty": float, "s": float
-            }
-        """
-        mA = self._load(stemA)
-        mB = self._load(stemB)
-        if not mA or not mB:
-            return {"score": 0.0, "matches": 0, "theta": 0.0, "tx": 0.0, "ty": 0.0, "s": 1.0}
-
-        A = np.array([[m["x"], m["y"]] for m in mA], dtype=np.float64)
-        B = np.array([[m["x"], m["y"]] for m in mB], dtype=np.float64)
-        thA = np.array([m.get("theta_img_deg", m.get("theta", 0.0)) for m in mA], dtype=np.float64)
-        thB = np.array([m.get("theta_img_deg", m.get("theta", 0.0)) for m in mB], dtype=np.float64)
-
-        theta, t, s = estimate_similarity(A, thA, B, thB, use_scale=self.use_scale, scale_tol=self.scale_tol)
-        pairs = greedy_match(A, thA, B, thB, theta, t, s, dist_tol=self.dist_tol_px, ang_tol_deg=self.ang_tol_deg)
-        m = len(pairs)
-
-        # map raw match count to [0,1] smoothly (soft cap ~ 20 matches)
-        score = float(1.0 - math.exp(-m / 10.0))
-        return {"score": score, "matches": int(m), "theta": float(theta), "tx": float(t[0]), "ty": float(t[1]), "s": float(s)}
+    def score_pair(self, out_dir: Path, stemA: str, stemB: str) -> Dict[str, float]:
+        minsA = load_minutiae(out_dir, stemA)
+        minsB = load_minutiae(out_dir, stemB)
+        theta, t, s = estimate_alignment(minsA, minsB, use_scale=self.use_scale)
+        m, pairs = greedy_match(minsA, minsB, theta, t, s,
+                                dist_tol_px=self.dist_tol_px,
+                                ang_tol_deg=self.ang_tol_deg)
+        score = 1.0 - math.exp(- m / 10.0)
+        return {
+            "score": score,
+            "matches": int(m),
+            "theta_deg": _rad2deg(theta),
+            "tx": float(t[0]),
+            "ty": float(t[1]),
+            "scale": float(s)
+        }

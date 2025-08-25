@@ -1,164 +1,263 @@
-# verify_soco_minutiae.py
+# scripts/run_soco_verify.py
+# SOCOFing runner:
+# - scans out/<stem>/ for minutiae files
+# - builds genuine & impostor pairs (same finger key)
+# - scores pairs with MinutiaeVerifier
+# - computes metrics (ROC-AUC, EER, best-F1, precision, recall)
+# - saves CSV, JSON and plots in results/
+
 from __future__ import annotations
 from pathlib import Path
-import re, numpy as np, csv
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple, List, Optional
+import re, json, math, random, csv
+import numpy as np
+import matplotlib.pyplot as plt
+
+# import the engine
 from fp.verifier import MinutiaeVerifier
 
-# --------------------------- CONFIG ---------------------------
-OUT_DIR = Path("out")        # where out/<stem>/<stem>.json live
-WRITE_PAIR_SCORES_CSV = True
-PAIR_SCORES_CSV = Path("pair_scores.csv")
+# ---------- Paths & settings (edit if needed) ----------
+OUT_DIR     = Path("out")
+RESULTS_DIR = Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Caps (set to None to use all)
-MAX_GENUINE  = 3000
+MAX_GENUINE  = 3000     # cap (None = all)
 MAX_IMPOSTOR = 3000
+RNG_SEED     = 123
 
-# --------------------------- SOCOFing parsing ---------------------------
-_ID_RE = re.compile(r"(?P<id>\d+)")
+# Matching hyper-params (must match your engine)
+DIST_TOL_PX  = 15.0
+ANG_TOL_DEG  = 20.0
+USE_SCALE    = False
+# -------------------------------------------------------
 
-def parse_id_finger(stem: str) -> Tuple[str, str]:
-    """
-    SOCOFing-like stems: 101__M_Left_index_finger[...]
-    Returns (subject_id, finger_key) e.g. ("101", "Left_index_finger")
-    """
-    m = _ID_RE.match(stem)
-    sid = m.group("id") if m else stem.split("__")[0]
-    parts = stem.split("__")
-    if len(parts) >= 3:
-        finger = parts[2]
-    else:
-        m2 = re.search(r"(Left|Right)_[A-Za-z]+_finger", stem)
-        finger = m2.group(0) if m2 else "unknown"
-    return sid, finger
 
-def build_index(out_dir: Path) -> Dict[str, Dict[str, List[str]]]:
-    """
-    idx[subject_id][finger] = [stems...]
-    from subfolders out/<stem> containing <stem>.json or <stem>.csv
-    """
-    idx: Dict[str, Dict[str, List[str]]] = {}
-    for sub in out_dir.iterdir():
-        if not sub.is_dir():
-            continue
-        stem = sub.name
-        if not (sub / f"{stem}.json").exists() and not (sub / f"{stem}.csv").exists():
-            continue
-        sid, finger = parse_id_finger(stem)
-        idx.setdefault(sid, {}).setdefault(finger, []).append(stem)
-    return idx
+# ---------------- Stem parsing for SOCOFing --------------
+SOCO_RE = re.compile(
+    r"^(?P<subject>\d+)__([MF])_(?P<hand>Left|Right)_(?P<finger>(thumb|index_finger|middle_finger|ring_finger|little_finger))",
+    re.IGNORECASE
+)
 
-# --------------------------- metrics ---------------------------
-def sweep_thresholds(genuine_scores: List[float], impostor_scores: List[float]):
+def parse_soco_stem(stem: str) -> Optional[Tuple[str, str]]:
     """
-    Compute EER (min |FAR-FRR|), ROC AUC, and precision/recall/F1 at best-F1 threshold.
+    Return (subject_id, finger_key) from a SOCOFing-like stem or None.
+    finger_key = "<Hand>_<finger>", e.g. "Left_index_finger"
     """
-    g = np.asarray(genuine_scores, float)
-    i = np.asarray(impostor_scores, float)
-    thr = np.unique(np.concatenate([g, i]))  # all achievable thresholds
-    if thr.size == 0:
+    m = SOCO_RE.match(stem)
+    if not m:
         return None
+    subject = m.group("subject")
+    finger_key = f"{m.group('hand').capitalize()}_{m.group('finger').lower()}"
+    return subject, finger_key
 
-    FAR_list, FRR_list = [], []
-    for t in thr:
-        FAR_list.append(np.mean(i >= t))  # impostor accepted
-        FRR_list.append(np.mean(g <  t))  # genuine rejected
-    FAR = np.asarray(FAR_list); FRR = np.asarray(FRR_list)
 
-    # EER
-    k = int(np.argmin(np.abs(FAR - FRR)))
-    EER = float((FAR[k] + FRR[k]) / 2.0); thr_eer = float(thr[k])
+def collect_stems(out_dir: Path = OUT_DIR) -> Dict[Tuple[str,str], List[str]]:
+    """
+    Group stems by (subject, finger_key) if minutiae file exists.
+    Returns: {(subject, finger_key): [stem, ...], ...}
+    """
+    groups: Dict[Tuple[str,str], List[str]] = {}
+    for p in out_dir.iterdir():
+        if not p.is_dir():
+            continue
+        stem = p.name
+        meta = parse_soco_stem(stem)
+        if meta is None:
+            continue
+        # ensure minutiae file exists
+        j = p / f"{stem}.json"
+        c = p / f"{stem}.csv"
+        if not j.exists() and not c.exists():
+            continue
+        key = (meta[0], meta[1])
+        groups.setdefault(key, []).append(stem)
 
-    # ROC AUC
-    TPR = 1.0 - FRR; FPR = FAR
-    order = np.argsort(FPR)
-    AUC = float(np.trapz(TPR[order], FPR[order]))
+    for k in groups:
+        groups[k] = sorted(groups[k])
+    return groups
 
-    # Best F1 (report precision/recall at that threshold)
-    bestF1, bestT, bestP, bestR = -1.0, thr[0], 0.0, 0.0
-    for t in thr:
-        TP = float(np.sum(g >= t)); FP = float(np.sum(i >= t)); FN = float(np.sum(g < t))
-        P  = TP / (TP + FP + 1e-12)
-        R  = TP / (TP + FN + 1e-12)
-        F1 = 2*P*R / (P + R + 1e-12)
-        if F1 > bestF1:
-            bestF1, bestT, bestP, bestR = float(F1), float(t), float(P), float(R)
 
-    return {"EER":EER, "thr_eer":thr_eer, "ROC_AUC":AUC,
-            "best_F1":bestF1, "thr_best_F1":bestT,
-            "precision_at_best_F1":bestP, "recall_at_best_F1":bestR}
+def make_pairs(groups: Dict[Tuple[str,str], List[str]],
+               max_genuine: Optional[int],
+               max_impostor: Optional[int]) -> Tuple[List[Tuple[str,str]], List[Tuple[str,str]]]:
+    """Build genuine pairs (same subject+finger) and impostor pairs (different subjects, same finger)."""
+    rng = random.Random(RNG_SEED)
 
-# --------------------------- main ---------------------------
+    # Genuine
+    genuines: List[Tuple[str,str]] = []
+    finger_to_subjects: Dict[str, List[Tuple[str, List[str]]]] = {}
+    for (subject, finger), stems in groups.items():
+        if len(stems) >= 2:
+            for i in range(len(stems)):
+                for j in range(i+1, len(stems)):
+                    genuines.append((stems[i], stems[j]))
+        finger_to_subjects.setdefault(finger, []).append((subject, stems))
+
+    # Impostors (sampled): choose one stem from subject A and one from subject B for the same finger
+    impostors: List[Tuple[str,str]] = []
+    for finger, items in finger_to_subjects.items():
+        if len(items) < 2:
+            continue
+        for i in range(len(items)):
+            subjA, stemsA = items[i]
+            for j in range(i+1, len(items)):
+                subjB, stemsB = items[j]
+                a = rng.choice(stemsA)
+                b = rng.choice(stemsB)
+                impostors.append((a, b))
+
+    rng.shuffle(genuines)
+    rng.shuffle(impostors)
+    if max_genuine is not None and len(genuines) > max_genuine:
+        genuines = genuines[:max_genuine]
+    if max_impostor is not None and len(impostors) > max_impostor:
+        impostors = impostors[:max_impostor]
+
+    return genuines, impostors
+
+
+# ---------------------- Metrics (no sklearn) ----------------------
+def _roc_points(scores: np.ndarray, labels: np.ndarray):
+    """Compute ROC points (FPR, TPR, thresholds) sweeping unique thresholds high->low."""
+    order = np.argsort(scores)[::-1]
+    s = scores[order]; y = labels[order]
+    P = float((y == 1).sum()); N = float((y == 0).sum())
+    tprs, fprs, thrs = [], [], []
+    tp = fp = 0.0; last = None
+
+    for i in range(len(s)):
+        if last is None or s[i] != last:
+            if last is not None:
+                tprs.append(tp / P if P > 0 else 0.0)
+                fprs.append(fp / N if N > 0 else 0.0)
+                thrs.append(last)
+            last = s[i]
+        if y[i] == 1: tp += 1.0
+        else:         fp += 1.0
+
+    tprs.append(tp / P if P > 0 else 0.0)
+    fprs.append(fp / N if N > 0 else 0.0)
+    thrs.append(last if last is not None else 1.0)
+    return np.array(fprs), np.array(tprs), np.array(thrs)
+
+def _auc_trapz(fpr: np.ndarray, tpr: np.ndarray) -> float:
+    order = np.argsort(fpr)
+    return float(np.trapz(tpr[order], fpr[order]))
+
+def _eer_from_roc(fpr: np.ndarray, tpr: np.ndarray, thr: np.ndarray):
+    fnr = 1.0 - tpr
+    idx = int(np.argmin(np.abs(fpr - fnr)))
+    eer = 0.5 * (fpr[idx] + fnr[idx])
+    return float(eer), float(thr[idx])
+
+def _best_f1(scores: np.ndarray, labels: np.ndarray):
+    thrs = np.unique(scores)[::-1]
+    best = (0.0, 0.0, 0.0, 0.0)  # F1, thr, P, R
+    for t in thrs:
+        pred = (scores >= t).astype(int)
+        tp = int(((pred == 1) & (labels == 1)).sum())
+        fp = int(((pred == 1) & (labels == 0)).sum())
+        fn = int(((pred == 0) & (labels == 1)).sum())
+        if tp + fp == 0 or tp + fn == 0: 
+            continue
+        P = tp / float(tp + fp)
+        R = tp / float(tp + fn)
+        if P + R == 0: 
+            continue
+        F1 = 2 * P * R / (P + R)
+        if F1 > best[0]:
+            best = (float(F1), float(t), float(P), float(R))
+    return best  # F1, thr, P, R
+
+
+# ----------------------------- Runner ------------------------------
 def main():
-    idx = build_index(OUT_DIR)
-    total_templates = sum(len(v) for d in idx.values() for v in d.values())
-    print(f"Indexed {total_templates} templates from {len(idx)} subjects.")
+    random.seed(RNG_SEED); np.random.seed(RNG_SEED)
 
-    # Build genuine / impostor pairs (stems only)
-    genuines, impostors = [], []
-
-    # Genuine: same subject & finger, different impressions
-    for sid, fingers in idx.items():
-        for finger, stems in fingers.items():
-            S = sorted(stems)
-            for a in range(len(S)):
-                for b in range(a+1, len(S)):
-                    genuines.append((S[a], S[b]))
-
-    # Impostor: different subjects, same finger (first impression for each)
-    subs = sorted(idx.keys())
-    for a in range(len(subs)):
-        for b in range(a+1, len(subs)):
-            fa, fb = idx[subs[a]], idx[subs[b]]
-            common = set(fa.keys()) & set(fb.keys())
-            for finger in common:
-                if not fa[finger] or not fb[finger]:
-                    continue
-                impostors.append((sorted(fa[finger])[0], sorted(fb[finger])[0]))
-
-    # Optional caps to keep runtime quick
-    rng = np.random.default_rng(0)
-    if MAX_GENUINE is not None and len(genuines) > MAX_GENUINE:
-        genuines = list(map(tuple, rng.choice(genuines, size=MAX_GENUINE, replace=False)))
-    if MAX_IMPOSTOR is not None and len(impostors) > MAX_IMPOSTOR:
-        impostors = list(map(tuple, rng.choice(impostors, size=MAX_IMPOSTOR, replace=False)))
-
-    print(f"Genuine pairs: {len(genuines)} | Impostor pairs: {len(impostors)}")
-
-    # Run matcher
-    verifier = MinutiaeVerifier(out_dir=OUT_DIR, dist_tol_px=15.0, ang_tol_deg=20.0, use_scale=False)
-    g_scores, i_scores = [], []
-    pairs_rows = []
-
-    for A, B in genuines:
-        r = verifier.score_pair(A, B)
-        g_scores.append(r["score"])
-        if WRITE_PAIR_SCORES_CSV:
-            pairs_rows.append((A, B, 1, r["score"], r["matches"]))
-
-    for A, B in impostors:
-        r = verifier.score_pair(A, B)
-        i_scores.append(r["score"])
-        if WRITE_PAIR_SCORES_CSV:
-            pairs_rows.append((A, B, 0, r["score"], r["matches"]))
-
-    # Metrics
-    stats = sweep_thresholds(g_scores, i_scores)
-    if stats is None:
-        print("Not enough pairs to evaluate.")
+    groups = collect_stems(OUT_DIR)
+    if not groups:
+        print(f"❌ No minutiae found under {OUT_DIR}/<stem>/<stem>.json|.csv")
         return
 
-    print("\n=== Minutiae-based Verification Metrics (SOCOFing) ===")
-    print(f"EER:       {stats['EER']:.4f}  at thr={stats['thr_eer']:.4f}")
-    print(f"ROC AUC:   {stats['ROC_AUC']:.4f}")
-    print(f"Best F1:   {stats['best_F1']:.4f}  at thr={stats['thr_best_F1']:.4f}")
-    print(f"Precision@bestF1: {stats['precision_at_best_F1']:.4f}")
-    print(f"Recall@bestF1:    {stats['recall_at_best_F1']:.4f}")
+    genuines, impostors = make_pairs(groups, MAX_GENUINE, MAX_IMPOSTOR)
+    print(f"📦 Pairs → genuine: {len(genuines)}, impostor: {len(impostors)}")
 
-    # Optional CSV of pair scores (for analysis)
-    if WRITE_PAIR_SCORES_CSV:
-        with open(PAIR_SCORES_CSV, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["stemA", "stemB", "label", "score", "matches"])
-            w.writerows(pairs_rows)
-        print(f"\nSaved pair scores to {PAIR_SCORES_CSV}")
+    verifier = MinutiaeVerifier(dist_tol_px=DIST_TOL_PX,
+                                ang_tol_deg=ANG_TOL_DEG,
+                                use_scale=USE_SCALE)
+
+    rows = []
+    scores = []
+    labels = []
+
+    # Score genuine
+    for A, B in genuines:
+        r = verifier.score_pair(OUT_DIR, A, B)
+        rows.append([A, B, 1, r["score"], r["matches"]])
+        scores.append(r["score"]); labels.append(1)
+
+    # Score impostor
+    for A, B in impostors:
+        r = verifier.score_pair(OUT_DIR, A, B)
+        rows.append([A, B, 0, r["score"], r["matches"]])
+        scores.append(r["score"]); labels.append(0)
+
+    scores = np.array(scores, dtype=float)
+    labels = np.array(labels, dtype=int)
+
+    # Metrics
+    fpr, tpr, thr = _roc_points(scores, labels)
+    auc = _auc_trapz(fpr, tpr)
+    eer, thr_eer = _eer_from_roc(fpr, tpr, thr)
+    bestF1, thr_f1, P_f1, R_f1 = _best_f1(scores, labels)
+
+    # Save CSV
+    csv_path = RESULTS_DIR / "soco_pairs_scores.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["stemA", "stemB", "label_genuine1", "score", "matches"])
+        w.writerows(rows)
+
+    # Save metrics JSON
+    metrics = {
+        "pairs": {"genuine": int((labels==1).sum()), "impostor": int((labels==0).sum())},
+        "matching_params": {
+            "dist_tol_px": DIST_TOL_PX,
+            "ang_tol_deg": ANG_TOL_DEG,
+            "use_scale": USE_SCALE
+        },
+        "metrics": {
+            "ROC_AUC": auc,
+            "EER": eer,
+            "threshold_at_EER": thr_eer,
+            "best_F1": bestF1,
+            "threshold_at_best_F1": thr_f1,
+            "precision_at_best_F1": P_f1,
+            "recall_at_best_F1": R_f1
+        }
+    }
+    (RESULTS_DIR / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+
+    # Plots
+    # ROC
+    plt.figure(figsize=(5,4))
+    plt.plot(fpr, tpr, lw=2)
+    plt.plot([0,1], [0,1], linestyle="--")
+    plt.xlabel("FPR"); plt.ylabel("TPR"); plt.title(f"ROC (AUC={auc:.3f})")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(RESULTS_DIR / "roc.png", dpi=140)
+    plt.close()
+
+    # score hist
+    plt.figure(figsize=(5,4))
+    plt.hist(scores[labels==1], bins=40, alpha=0.6, label="genuine")
+    plt.hist(scores[labels==0], bins=40, alpha=0.6, label="impostor")
+    plt.xlabel("score"); plt.ylabel("count"); plt.title("Score distribution")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(RESULTS_DIR / "hist.png", dpi=140)
+    plt.close()
+
+    print(f"✅ Done. Saved:\n  - {csv_path}\n  - {RESULTS_DIR/'metrics.json'}\n  - {RESULTS_DIR/'roc.png'}\n  - {RESULTS_DIR/'hist.png'}")
+
+if __name__ == "__main__":
+    main()
