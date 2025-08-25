@@ -101,43 +101,58 @@ def vote_rotation(minsA: List[Minutia],
     return cands
 
 
+# --- replace your estimate_alignment() with this version ---
 def estimate_alignment(minsA: List[Minutia],
                        minsB: List[Minutia],
                        use_scale: bool = False) -> Tuple[float, np.ndarray, float]:
     """
-    Estimate (theta, t, s) such that A' = s * R(theta) * A + t approximately aligns A to B.
-    - theta: radians
-    - t: (tx, ty)
-    - s: ~1.0 (only if use_scale=True)
+    Estimate (theta, t, s) by trying several rotation candidates and
+    keeping the one that yields the most greedy matches.
     """
     if not minsA or not minsB:
         return 0.0, np.zeros(2, dtype=float), 1.0
 
-    thetas = vote_rotation(minsA, minsB)
-    Axy = np.array([[m.x, m.y] for m in minsA], dtype=float)
-    Bxy = np.array([[m.x, m.y] for m in minsB], dtype=float)
+    # candidates from orientation voting
+    cand_thetas = vote_rotation(minsA, minsB, top_k=5)  # try more than 1
 
-    best = None
-    for th in thetas:
+    Axy0 = np.array([[m.x, m.y] for m in minsA], dtype=float)
+    Bxy  = np.array([[m.x, m.y] for m in minsB], dtype=float)
+
+    best = (0.0, np.zeros(2, float), 1.0)
+    best_m = -1
+
+    for th in cand_thetas:
         c, s = math.cos(th), math.sin(th)
         R = np.array([[c, -s], [s, c]], dtype=float)
-        A_rot = (R @ Axy.T).T
+        Arot = (R @ Axy0.T).T
 
         if use_scale:
-            cenA = A_rot.mean(axis=0)
-            cenB = Bxy.mean(axis=0)
-            rA = np.median(np.linalg.norm(A_rot - cenA, axis=1))
-            rB = np.median(np.linalg.norm(Bxy - cenB, axis=1))
-            sc = 1.0 if rA <= 1e-6 else np.clip(rB / rA, 0.85, 1.15)
+            cenA = Arot.mean(axis=0); cenB = Bxy.mean(axis=0)
+            rA = np.median(np.linalg.norm(Arot - cenA, axis=1))
+            rB = np.median(np.linalg.norm(Bxy  - cenB, axis=1))
+            sc = 1.0 if rA <= 1e-6 else float(np.clip(rB / rA, 0.85, 1.15))
         else:
             sc = 1.0
 
-        t = Bxy.mean(axis=0) - sc * A_rot.mean(axis=0)
-        # simple selection: keep the candidate with higher vote (order of thetas)
-        cand = (th, t, sc)
-        best = cand if best is None else best
+        t = Bxy.mean(axis=0) - sc * Arot.mean(axis=0)
 
-    return best[0], best[1], best[2]
+        # quick greedy count to score this candidate
+        cA = []
+        Axy = (sc * (R @ Axy0.T).T) + t
+        used_B = np.zeros(len(minsB), dtype=bool)
+        for i, a in enumerate(Axy):
+            j = int(np.argmin(np.linalg.norm(Bxy - a, axis=1)))
+            if used_B[j]:
+                continue
+            used_B[j] = True
+            cA.append((i, j))
+
+        m = len(cA)
+        if m > best_m:
+            best_m = m
+            best = (th, t, sc)
+
+    return best
 
 
 # ----------- Step C: greedy 1-to-1 minutiae matching --------
